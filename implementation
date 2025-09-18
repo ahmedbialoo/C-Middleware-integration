@@ -1,0 +1,306 @@
+🔹 1. Models
+PaymentContract.cs
+
+This class represents a single payment we receive in JSON.
+
+namespace PaymentForwarder.Models
+{
+    public class PaymentContract
+    {
+        public string InvoiceNo { get; set; }
+        public string BillNo { get; set; }
+        public string InternalCode { get; set; }
+        public decimal PaymentAmount { get; set; }
+        public DateTime PaymentDate { get; set; }
+        public List<int> ProductIds { get; set; }
+        public string EPTN { get; set; }
+    }
+}
+
+
+🔹 Why?
+
+Matches the fields inside SC_InvoicePaymentContract in X++.
+
+This is the object shape expected from Postman input.
+
+ForwardResult.cs
+
+Represents the response we return back to Postman.
+
+namespace PaymentForwarder.Models
+{
+    public class ForwardResult
+    {
+        public int Forwarded { get; set; }      // how many payments sent
+        public bool Success { get; set; }       // true if Dynamics accepted
+        public string Message { get; set; }     // high-level status
+        public string? DynamicsError { get; set; } // optional: raw Dynamics message
+    }
+}
+
+
+🔹 Why?
+
+Keeps the API response clean and easy to read.
+
+Helps separate technical details from business responses.
+
+🔹 2. Service Layer
+IDynamicsClient.cs
+
+Defines our service contract.
+
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using PaymentForwarder.Models;
+
+namespace PaymentForwarder.Services
+{
+    public interface IDynamicsClient
+    {
+        Task<ForwardResult> SendPaymentsAsync(IEnumerable<PaymentContract> payments);
+    }
+}
+
+
+🔹 Why?
+
+Abstraction makes the service testable and clean.
+
+Keeps controller separate from Dynamics implementation details.
+
+DynamicsClient.cs
+
+Handles authentication + sending requests to Dynamics.
+
+using System;
+using System.Collections.Generic;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Configuration;
+using PaymentForwarder.Models;
+
+namespace PaymentForwarder.Services
+{
+    public class DynamicsClient : IDynamicsClient
+    {
+        private readonly IHttpClientFactory _httpFactory;
+        private readonly IConfiguration _config;
+
+        public DynamicsClient(IHttpClientFactory httpFactory, IConfiguration config)
+        {
+            _httpFactory = httpFactory;
+            _config = config;
+        }
+
+        // 1️⃣ Acquire Azure AD token using OAuth2 v1.0
+        private async Task<string> AcquireTokenAsync()
+        {
+            var tenant = _config["AzureAd:TenantId"];
+            var clientId = _config["AzureAd:ClientId"];
+            var clientSecret = _config["AzureAd:ClientSecret"];
+            var resource = _config["AzureAd:Resource"];
+
+            var tokenUrl = $"https://login.microsoftonline.com/{tenant}/oauth2/token";
+
+            using var client = new HttpClient();
+            var body = new Dictionary<string, string>
+            {
+                { "grant_type", "client_credentials" },
+                { "client_id", clientId },
+                { "client_secret", clientSecret },
+                { "resource", resource }
+            };
+
+            var response = await client.PostAsync(tokenUrl, new FormUrlEncodedContent(body));
+            var json = await response.Content.ReadAsStringAsync();
+
+            if (!response.IsSuccessStatusCode)
+                throw new Exception($"Failed to acquire token. Status: {response.StatusCode}, Body: {json}");
+
+            using var doc = JsonDocument.Parse(json);
+            return doc.RootElement.GetProperty("access_token").GetString();
+        }
+
+        // 2️⃣ Send wrapped invoices to Dynamics
+        public async Task<ForwardResult> SendPaymentsAsync(IEnumerable<PaymentContract> payments)
+        {
+            var wrapper = new { Invoices = payments }; // 👈 Matches X++ parameter
+
+            var client = _httpFactory.CreateClient("dynamics-client");
+            var token = await AcquireTokenAsync();
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+            var endpoint = _config["Dynamics:EndpointPath"];
+            var json = JsonSerializer.Serialize(wrapper); // 👈 Keep property as "Invoices"
+
+            var resp = await client.PostAsync(endpoint, new StringContent(json, Encoding.UTF8, "application/json"));
+            var body = await resp.Content.ReadAsStringAsync();
+
+            if (resp.IsSuccessStatusCode)
+            {
+                return new ForwardResult
+                {
+                    Forwarded = payments != null ? System.Linq.Enumerable.Count(payments) : 0,
+                    Success = true,
+                    Message = "Sent to Dynamics successfully"
+                };
+            }
+
+            string cleanMessage = body;
+            try
+            {
+                using var doc = JsonDocument.Parse(body);
+                if (doc.RootElement.TryGetProperty("Message", out var msg))
+                {
+                    cleanMessage = msg.GetString();
+                }
+            }
+            catch { }
+
+            return new ForwardResult
+            {
+                Forwarded = payments != null ? System.Linq.Enumerable.Count(payments) : 0,
+                Success = false,
+                Message = "Dynamics rejected the request",
+                DynamicsError = cleanMessage
+            };
+        }
+    }
+}
+
+
+🔹 Why?
+
+Authenticates with Azure AD using client credentials.
+
+Wraps [ { ... } ] into { "Invoices": [ ... ] } for Dynamics.
+
+Returns a structured result object.
+
+🔹 3. Controller
+PaymentsController.cs
+
+Accepts requests from Postman/external systems.
+
+using Microsoft.AspNetCore.Mvc;
+using PaymentForwarder.Models;
+using PaymentForwarder.Services;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+
+namespace PaymentForwarder.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    public class PaymentsController : ControllerBase
+    {
+        private readonly IDynamicsClient _dynamicsClient;
+
+        public PaymentsController(IDynamicsClient dynamicsClient)
+        {
+            _dynamicsClient = dynamicsClient;
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> Receive([FromBody] List<PaymentContract> payments)
+        {
+            if (payments == null || payments.Count == 0)
+                return BadRequest("Request must be a non-empty JSON array of payments.");
+
+            var result = await _dynamicsClient.SendPaymentsAsync(payments);
+
+            if (result.Success)
+                return Ok(result);
+
+            return StatusCode(400, result); // BadRequest if Dynamics rejects
+        }
+    }
+}
+
+
+🔹 Why?
+
+Accepts array input ([...]) as required.
+
+Forwards to service.
+
+Returns clean JSON result.
+
+🔹 4. appsettings.json
+
+Configuration for authentication + endpoint.
+
+{
+  "AzureAd": {
+    "TenantId": "f5759d6c-b019-4692-b7a3-853753de6044",
+    "ClientId": "YOUR-CLIENT-ID",
+    "ClientSecret": "YOUR-CLIENT-SECRET",
+    "Resource": "https://usnconeboxax1aos.cloud.onebox.dynamics.com"
+  },
+  "Dynamics": {
+    "EndpointPath": "https://usnconeboxax1aos.cloud.onebox.dynamics.com/api/services/SC_ReceivePaymentServGroup/SC_ReceivePaymentService/processPayments"
+  }
+}
+
+
+🔹 Why?
+
+TenantId, ClientId, ClientSecret → used for token acquisition.
+
+Resource → the Dynamics base URL (needed for v1.0 authentication).
+
+EndpointPath → the actual service endpoint to call.
+
+🔹 5. Example Flow
+Postman request (external system sends array)
+[
+  {
+    "InvoiceNo": "00260858044908",
+    "BillNo": "0026085790003001",
+    "InternalCode": "{77F8994F-CD6E-4615-883F-3138ACE8FEA0}",
+    "PaymentAmount": 2000,
+    "PaymentDate": "2025-09-17T17:13:25.8331962+03:00",
+    "ProductIds": [2203],
+    "EPTN": "638919980058331962"
+  }
+]
+
+Middleware forwards to Dynamics
+{
+  "Invoices": [
+    {
+      "InvoiceNo": "00260858044908",
+      "BillNo": "0026085790003001",
+      "InternalCode": "{77F8994F-CD6E-4615-883F-3138ACE8FEA0}",
+      "PaymentAmount": 2000,
+      "PaymentDate": "2025-09-17T17:13:25.8331962+03:00",
+      "ProductIds": [2203],
+      "EPTN": "638919980058331962"
+    }
+  ]
+}
+
+Middleware response
+
+✅ Success:
+
+{
+  "forwarded": 1,
+  "success": true,
+  "message": "Sent to Dynamics successfully"
+}
+
+
+❌ Duplicate error:
+
+{
+  "forwarded": 1,
+  "success": false,
+  "message": "Dynamics rejected the request",
+  "dynamicsError": "Cannot create a record in Customer Invoice Payments (SC_InvoicePaymentLog). The record already exists."
+}
