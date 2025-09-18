@@ -1,0 +1,10 @@
+We needed to:
+
+Accept JSON as an array [...] from an external system (like Postman or EDAAT).
+Transform it into the format that Dynamics 365 F&O service expects:
+{
+  "Invoices": [ { ... } ]
+}
+1. Authenticate with Azure AD v1.0 (OAuth2 client_credentials).
+2. Call the Dynamics service SC_ReceivePaymentService.processPayments(List Invoices).
+3. Return clean, business-friendly responses instead of raw Dynamics errors.
